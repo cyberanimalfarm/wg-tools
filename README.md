@@ -10,4 +10,4 @@ Components:
 
 ​	o InstallSignalEN.py :: Untested, but it's supposed to install and setup the signal-cli.
 
- 	o tv-notify.py :: This script will generate a configuration file in /etc/wireguard/clients/ that you can add a signal account to (that is already setup in signal-cli) and a few "subscribers" to (other signal phone numbers with country code) and every time the script runs it will check send a signal message to notify if a client has connected. I set it up on a cronjob to run every minute or so and it works fine. 
+​	o tv-notify.py :: This script will generate a configuration file in /etc/wireguard/clients/ that you can add a signal account to (that is already setup in signal-cli) and a few "subscribers" to (other signal phone numbers with country code) and every time the script runs it will check send a signal message to notify if a client has connected. I set it up on a cronjob to run every minute or so and it works fine.
