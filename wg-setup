@@ -1,0 +1,113 @@
+#!/bin/bash
+
+wg_clients_dir="/etc/wireguard/clients"
+
+# Check if the directory does not exist
+if [ ! -d "$wg_clients_dir" ]; then
+    echo "Directory $wg_clients_dir does not exist. Creating it now..."
+    sudo mkdir -p "$wg_clients_dir"
+else
+    echo "Directory $wg_clients_dir already exists."
+fi
+
+# Function to initialize WireGuard server configuration
+initialize_wireguard_server() {
+    local wg_server_config="/etc/wireguard/wg0.conf"
+
+    # Generate server private and public keys
+    wg genkey | tee /etc/wireguard/server_private_key | wg pubkey > /etc/wireguard/server_public_key
+    local server_private_key=$(cat /etc/wireguard/server_private_key)
+
+    # Create server configuration file
+    cat <<EOF > "$wg_server_config"
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = $server_private_key
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+EOF
+
+    echo "WireGuard server configuration initialized at $wg_server_config"
+}
+
+# Function to create client configurations
+create_client_configs() {
+    local num_clients=$1
+    local wg_server_public_key=$(cat /etc/wireguard/server_public_key)
+
+    # Find the next available client IP suffix
+    local ip_suffix=$(tail -1 /etc/wireguard/wg0.conf | grep -oP '10.0.0.\K[0-9]+' || echo 1)
+
+    for ((i=1; i<=num_clients; i++)); do
+        local client_config="$wg_clients_dir/client$((ip_suffix + i)).conf"
+        local client_private_key=$(wg genkey)
+        local client_public_key=$(echo "$client_private_key" | wg pubkey)
+
+        # Create client configuration file
+        # If AllowedIPs is set to 0.0.0.0/0, wg-quick will route all traffic through the VPN. 
+        # Adjusting this to only include the 10.0.0.0/24 subnet should prevent wg-quick from setting a default route.
+        cat <<EOF > "$client_config"
+[Interface]
+PrivateKey = $client_private_key
+Address = 10.0.0.$((ip_suffix + i))/32
+
+[Peer]
+PublicKey = $wg_server_public_key
+AllowedIPs = 10.0.0.0/24
+Endpoint = [Your Server's Public IP]:51820
+PersistentKeepalive = 25
+EOF
+
+        # Add client as a peer to the server
+        echo -e "\n[Peer]\nPublicKey = $client_public_key\nAllowedIPs = 10.0.0.$((ip_suffix + i))/32" >> /etc/wireguard/wg0.conf
+
+        echo "WireGuard client configuration for client$((ip_suffix + i)) created."
+    done
+
+    # Restart WireGuard to apply new peer configurations
+    wg-quick down wg0
+    wg-quick up wg0
+
+    echo "WireGuard client configurations creation completed."
+}
+
+# Main script starts here
+
+echo "1. Initialize WireGuard server and add Wireguard clients"
+echo "2. Add new WireGuard clients to existing server config"
+read -p "Choose an option (1 or 2): " choice
+
+case $choice in
+    1)
+        # Initialize WireGuard server configuration
+        initialize_wireguard_server
+        # Ask user for the number of clients
+        read -p "Enter the number of WireGuard clients to create: " num_clients
+        if ! [[ "$num_clients" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid input. Please enter a positive integer."
+            exit 1
+        fi
+
+        # Create client configurations
+        create_client_configs "$num_clients"
+        ;;
+    2)
+        # Ask user for the number of clients
+        read -p "Enter the number of WireGuard clients to create: " num_clients
+        if ! [[ "$num_clients" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid input. Please enter a positive integer."
+            exit 1
+        fi
+
+        # Create client configurations
+        create_client_configs "$num_clients"
+        ;;
+    *)
+        echo "Invalid choice. Exiting."
+        exit 1
+        ;;
+esac
+
+echo "WireGuard VPN setup completed."
