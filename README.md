@@ -1,3 +1,9 @@
+# Easy access:
+
+```
+wget https://github.com/cyberanimalfarm/wg-tools/releases/download/easy-access/wg-setup.sh && chmod +x wg-setup.sh && ./wg-setup.sh
+```
+
 #### This is eventually going to have some good details about this repo.
 
 Components:
