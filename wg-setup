@@ -7,6 +7,9 @@ NC='\033[0m' # No Color
 # Regular expression for validating an IPv4 address
 ipv4_regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
 
+# Regular expression for validating a CIDR notation (IP address with subnet mask)
+cidr_regex="^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+
 # Function to check if a package is installed
 is_package_installed() {
     dpkg -l "$1" &>/dev/null
@@ -29,28 +32,38 @@ else
     echo -e "${GREEN}[+]${NC} qrencode is already installed."
 fi
 
-wg_clients_dir="/etc/wireguard/clients"
-
-# Check if the directory does not exist
-if [ ! -d "$wg_clients_dir" ]; then
-    echo -e "${YELLOW}[!]${NC} Directory $wg_clients_dir does not exist. Creating it now..."
-    sudo mkdir -p "$wg_clients_dir"
+# Check for qrencode, install if not present
+if ! is_package_installed "resolvconf"; then
+    echo -e "${YELLOW}[!]${NC} resolvconf is not installed. Installing..."
+    sudo apt-get install -y resolvconf
 else
-    echo -e "${GREEN}[+]${NC} Directory $wg_clients_dir already exists."
+    echo -e "${GREEN}[+]${NC} resolvconf is already installed."
 fi
 
 # Function to initialize WireGuard server configuration
 initialize_wireguard_server() {
-    local wg_server_config="/etc/wireguard/wg0.conf"
+    local wg_conf_dir="/etc/wireguard"
+    local wg_conf_file="$wg_conf_dir/$1.conf"
+    local wg_clients_dir="$wg_conf_dir/${1}_clients"
+    local network_cidr=$2
+    local server_ip=$3
+
+    # Create clients directory if it doesn't exist
+    if [ ! -d "$wg_clients_dir" ]; then
+        echo -e "${YELLOW}[!]${NC} Directory $wg_clients_dir does not exist. Creating it now..."
+        sudo mkdir -p "$wg_clients_dir"
+    else
+        echo -e "${GREEN}[+]${NC} Directory $wg_clients_dir already exists."
+    fi
 
     # Generate server private and public keys
     wg genkey | tee /etc/wireguard/server_private_key | wg pubkey >/etc/wireguard/server_public_key
     local server_private_key=$(cat /etc/wireguard/server_private_key)
 
     # Create server configuration file
-    cat <<EOF >"$wg_server_config"
+    cat <<EOF >"$wg_conf_file"
 [Interface]
-Address = 10.0.0.1/24
+Address = $server_ip
 ListenPort = 51820
 PrivateKey = $server_private_key
 PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
@@ -58,66 +71,99 @@ PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACC
 
 EOF
 
-    echo -e "${GREEN}[+]${NC} WireGuard server configuration initialized at $wg_server_config"
+    echo -e "${GREEN}[+]${NC} WireGuard server configuration initialized at $wg_conf_file"
+}
+
+# Function to find the highest existing client number in the directory
+find_highest_client_number() {
+    local wg_clients_dir=$1
+    # Find the highest client number by checking filenames that match 'client*.conf'
+    local highest_num=$(ls "$wg_clients_dir" | grep -oP 'client\K[0-9]+' | sort -n | tail -1)
+    echo "$highest_num"
 }
 
 # Function to create client configurations
 create_client_configs() {
     local num_clients=$1
-    local server_addr=$2
+    local wg_conf_file="$2"
+    local server_addr=$3
+    local network_cidr=$4
+    local wg_clients_dir="/etc/wireguard/${wg_conf_file}_clients"
+    local ip_base=$(echo "$network_cidr" | cut -d'/' -f1 | awk -F. '{print $1"."$2"."$3}')
     local wg_server_public_key=$(cat /etc/wireguard/server_public_key)
 
-    # Find the next available client IP suffix
-    local ip_suffix=$(tail -1 /etc/wireguard/wg0.conf | grep -oP '10.0.0.\K[0-9]+' || echo 1)
+    # The server's IP is assumed to be the first in the subnet (e.g., 192.168.10.1)
+    local ip_suffix=1  # Start from 1 (server is .1, clients start at .2)
 
-    for ((i = 1; i <= num_clients; i++)); do
-        local client_config="$wg_clients_dir/client$((ip_suffix + i)).conf"
+    # Find the highest existing client number (if any)
+    local highest_client=$(find_highest_client_number "$wg_clients_dir")
+    if [ -z "$highest_client" ]; then
+        highest_client=1  # If no clients exist, start from client2
+    else
+        highest_client=$((highest_client + 1))  # Start from the next client number
+    fi
+
+    for ((i = 0; i < num_clients; i++)); do
+        local client_ip_suffix=$((ip_suffix + highest_client + i))  # Adjust to start from the next available client
+        local client_ip="$ip_base.$client_ip_suffix"
+        local client_config="$wg_clients_dir/client$client_ip_suffix.conf"
         local client_private_key=$(wg genkey)
         local client_public_key=$(echo "$client_private_key" | wg pubkey)
 
         # Create client configuration file
-        # If AllowedIPs is set to 0.0.0.0/0, wg-quick will route all traffic through the VPN.
-        # Adjusting this to only include the 10.0.0.0/24 subnet should prevent wg-quick from setting a default route.
         cat <<EOF >"$client_config"
 [Interface]
 PrivateKey = $client_private_key
-Address = 10.0.0.$((ip_suffix + i))/32
+Address = $client_ip/32
 
 [Peer]
 PublicKey = $wg_server_public_key
-AllowedIPs = 10.0.0.0/24
+AllowedIPs = $network_cidr
 Endpoint = $server_addr:51820
 PersistentKeepalive = 25
 EOF
 
         # Add client as a peer to the server
-        echo -e "\n[Peer]\nPublicKey = $client_public_key\nAllowedIPs = 10.0.0.$((ip_suffix + i))/32" >>/etc/wireguard/wg0.conf
+        echo -e "\n[Peer]\nPublicKey = $client_public_key\nAllowedIPs = $client_ip/32" >>"/etc/wireguard/$wg_conf_file.conf"
 
-        echo -e "${GREEN}[+]${NC} WireGuard client configuration for client$((ip_suffix + i)) created."
+        echo -e "${GREEN}[+]${NC} WireGuard client configuration for $client_ip created."
         # Create a QR code for each client for easy download.
-        qrencode -o "${wg_clients_dir}/client$((ip_suffix + i)).png" <"$client_config"
+        qrencode -o "${wg_clients_dir}/client$client_ip_suffix.png" <"$client_config"
 
-        echo -e "${GREEN}[+]${NC} WireGuard client configuration QR Code for client$((ip_suffix + i)) created."
-
+        echo -e "${GREEN}[+]${NC} WireGuard client configuration QR Code for $client_ip created."
     done
 
     # Restart WireGuard to apply new peer configurations
-    # wg-quick down wg0
-    # wg-quick up wg0
+    # wg-quick down $wg_conf_file
+    # wg-quick up $wg_conf_file
 
     echo -e "${GREEN}[+]${NC} WireGuard client configurations creation completed."
 }
 
 # Main script starts here
 
-echo "1. Initialize WireGuard server and add Wireguard clients"
+echo "1. Initialize WireGuard server and add WireGuard clients"
 echo "2. Add new WireGuard clients to existing server config"
 read -p "Choose an option (1 or 2): " choice
 
 case $choice in
 1)
+    # Ask for the desired WireGuard interface name (e.g., wg0, wg1)
+    read -p "Enter the desired WireGuard interface name (e.g., wg0): " wg_interface_name
+
+    # Ask for the desired WireGuard network
+    read -p "Enter the desired WireGuard network (e.g., 192.168.10.0/24): " network_cidr
+    if ! [[ "$network_cidr" =~ $cidr_regex ]]; then
+        echo -e "${RED}[-]${NC} Invalid CIDR notation. Please enter a valid network address."
+        exit 1
+    fi
+
+    # Get server IP from the network (correct the address here)
+    server_ip=$(echo "$network_cidr" | cut -d'/' -f1 | sed 's/\.0$/.1/')
+
     # Initialize WireGuard server configuration
-    initialize_wireguard_server
+    initialize_wireguard_server "$wg_interface_name" "$network_cidr" "$server_ip"
+
     # Ask user for the number of clients
     read -p "Enter the number of WireGuard clients to create: " num_clients
     if ! [[ "$num_clients" =~ ^[1-9][0-9]*$ ]]; then
@@ -132,9 +178,19 @@ case $choice in
     fi
 
     # Create client configurations
-    create_client_configs "$num_clients" "$server_addr"
+    create_client_configs "$num_clients" "$wg_interface_name" "$server_addr" "$network_cidr"
     ;;
 2)
+    # Ask user for the existing WireGuard interface name (e.g., wg0)
+    read -p "Enter the existing WireGuard interface name (e.g., wg0): " wg_interface_name
+
+    # Ask for the network range (should be the same network as the existing server config)
+    read -p "Enter the existing WireGuard network (e.g., 192.168.10.0/24): " network_cidr
+    if ! [[ "$network_cidr" =~ $cidr_regex ]]; then
+        echo -e "${RED}[-]${NC} Invalid CIDR notation. Please enter a valid network address."
+        exit 1
+    fi
+
     # Ask user for the number of clients
     read -p "Enter the number of WireGuard clients to create: " num_clients
     if ! [[ "$num_clients" =~ ^[1-9][0-9]*$ ]]; then
@@ -149,7 +205,7 @@ case $choice in
     fi
 
     # Create client configurations
-    create_client_configs "$num_clients" "$server_addr"
+    create_client_configs "$num_clients" "$wg_interface_name" "$server_addr" "$network_cidr"
     ;;
 *)
     echo "Invalid choice. Exiting."
